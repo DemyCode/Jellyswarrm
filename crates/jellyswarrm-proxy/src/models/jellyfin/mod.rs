@@ -300,26 +300,11 @@ pub enum ItemsResponseVariants {
 }
 
 impl ItemsResponseVariants {
-    pub fn iter_mut_items(&mut self) -> std::slice::IterMut<'_, MediaItem> {
-        match self {
-            ItemsResponseVariants::WithCount(w) => w.items.iter_mut(),
-            ItemsResponseVariants::Bare(v) => v.iter_mut(),
-        }
-    }
-
     /// Return number of items contained in either variant.
     pub fn len(&self) -> usize {
         match self {
             ItemsResponseVariants::WithCount(w) => w.items.len(),
             ItemsResponseVariants::Bare(v) => v.len(),
-        }
-    }
-
-    /// Return item at `index` if present.
-    pub fn get(&self, index: usize) -> Option<&MediaItem> {
-        match self {
-            ItemsResponseVariants::WithCount(w) => w.items.get(index),
-            ItemsResponseVariants::Bare(v) => v.get(index),
         }
     }
 
@@ -376,6 +361,7 @@ pub struct MediaItem {
     pub media_sources: Option<Vec<MediaSource>>,
     pub media_streams: Option<Vec<MediaStream>>,
     pub chapters: Option<Vec<Chapter>>,
+    pub people: Option<Vec<Person>>,
     pub trickplay: Option<std::collections::HashMap<String, serde_json::Value>>,
 
     #[serde(flatten)]
@@ -404,6 +390,7 @@ pub struct MediaSource {
     pub required_http_headers: Option<serde_json::Value>,
     pub transcoding_sub_protocol: Option<String>,
     pub transcoding_url: Option<String>,
+    pub stream_url: Option<String>,
     pub transcoding_container: Option<String>,
     pub default_audio_stream_index: Option<i32>,
     pub default_subtitle_stream_index: Option<i32>,
