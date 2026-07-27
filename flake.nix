@@ -37,7 +37,7 @@
 
         jellyswarrm = rustPlatform.buildRustPackage {
           pname = "jellyswarrm";
-          version = "0.2.1";
+          version = "0.3.0";
 
           src = self;
 
@@ -70,6 +70,7 @@
           postInstall = ''
             wrapProgram $out/bin/jellyswarrm-proxy \
               --set SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+            ln -s $out/bin/jellyswarrm-proxy $out/bin/jellyswarrm
           '';
         };
 
