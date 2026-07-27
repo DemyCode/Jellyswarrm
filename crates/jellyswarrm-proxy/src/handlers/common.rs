@@ -68,18 +68,19 @@ pub async fn execute_json_request<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let response = client
-        .execute(request)
-        .await
-        .map_err(|e| {
-            error!("Failed to execute request: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?
-        .error_for_status()
-        .map_err(|e| {
-            error!("Request failed with status: {}", e);
-            StatusCode::UNAUTHORIZED
-        })?;
+    let response = client.execute(request).await.map_err(|e| {
+        error!("Failed to execute request: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        error!(
+            "Upstream request to {} failed with status {}",
+            response.url(),
+            status
+        );
+        return Err(status);
+    }
 
     let response_text = response.text().await.map_err(|e| {
         error!("Failed to get response text: {}", e);
@@ -428,17 +429,18 @@ mod tests {
 
     use serde_json::json;
     use sqlx::SqlitePool;
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::{
         config::{AppConfig, MediaStreamingMode, MIGRATOR},
         media_storage_service::MediaStorageService,
-        merged_library_service::MergedLibraryService,
         server_id::ServerId,
         server_storage::ServerStorageService,
         server_url::ServerUrl,
         session_storage::SessionStorage,
         user_authorization_service::UserAuthorizationService,
+        virtual_library_service::VirtualLibraryService,
         DataContext, ProxyProcessors,
     };
 
@@ -476,12 +478,18 @@ mod tests {
             server_id: "proxy-server".to_string(),
             ..AppConfig::default()
         };
+        let server_storage = ServerStorageService::new(pool.clone());
+        let media_storage = MediaStorageService::new(pool.clone());
 
         let data_context = DataContext {
             user_authorization: Arc::new(UserAuthorizationService::new(pool.clone())),
-            server_storage: Arc::new(ServerStorageService::new(pool.clone())),
-            media_storage: Arc::new(MediaStorageService::new(pool.clone())),
-            merged_library_service: Arc::new(MergedLibraryService::new(pool)),
+            server_storage: Arc::new(server_storage.clone()),
+            media_storage: Arc::new(media_storage.clone()),
+            virtual_library_service: Arc::new(VirtualLibraryService::new(
+                pool,
+                server_storage,
+                media_storage,
+            )),
             play_sessions: Arc::new(SessionStorage::new()),
             config: Arc::new(tokio::sync::RwLock::new(config)),
         };
@@ -498,6 +506,21 @@ mod tests {
             ),
             server,
         )
+    }
+
+    #[tokio::test]
+    async fn execute_json_request_preserves_upstream_not_found_status() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let client = reqwest::Client::new();
+        let request = client.get(upstream.uri()).build().unwrap();
+
+        let result = execute_json_request::<serde_json::Value>(&client, request).await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

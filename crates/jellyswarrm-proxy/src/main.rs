@@ -27,13 +27,15 @@ use axum_login::{
 };
 
 mod config;
+#[cfg(debug_assertions)]
+mod debug_initialization;
+mod duplicate_handling;
 mod encryption;
 mod extractors;
 mod federated_users;
 mod handlers;
 mod legacy_server_identity;
 mod media_storage_service;
-mod merged_library_service;
 mod models;
 mod processors;
 mod proxy_headers;
@@ -45,14 +47,15 @@ mod session_storage;
 mod ui;
 mod url_helper;
 mod user_authorization_service;
+mod virtual_library_service;
 
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
 use legacy_server_identity::canonicalize_legacy_server_identity;
 use media_storage_service::MediaStorageService;
-use merged_library_service::MergedLibraryService;
 use server_storage::{Server, ServerStorageService};
 use user_authorization_service::UserAuthorizationService;
+use virtual_library_service::VirtualLibraryService;
 
 use crate::{
     config::{AppConfig, MIGRATOR},
@@ -86,7 +89,7 @@ pub struct AppState {
     pub user_authorization: Arc<UserAuthorizationService>,
     pub server_storage: Arc<ServerStorageService>,
     pub media_storage: Arc<MediaStorageService>,
-    pub merged_library_service: Arc<MergedLibraryService>,
+    pub virtual_library_service: Arc<VirtualLibraryService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
     pub processors: Arc<ProxyProcessors>,
@@ -118,7 +121,7 @@ impl AppState {
             user_authorization: data_context.user_authorization,
             server_storage: data_context.server_storage,
             media_storage: data_context.media_storage,
-            merged_library_service: data_context.merged_library_service,
+            virtual_library_service: data_context.virtual_library_service,
             play_sessions: data_context.play_sessions,
             config: data_context.config,
             processors: Arc::new(proxy_processors),
@@ -204,7 +207,7 @@ pub struct DataContext {
     pub user_authorization: Arc<UserAuthorizationService>,
     pub server_storage: Arc<ServerStorageService>,
     pub media_storage: Arc<MediaStorageService>,
-    pub merged_library_service: Arc<MergedLibraryService>,
+    pub virtual_library_service: Arc<VirtualLibraryService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
 }
@@ -372,16 +375,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize media storage service
     let media_storage = MediaStorageService::new(pool.clone());
 
-    let merged_library_service = MergedLibraryService::new(pool.clone());
+    let virtual_library_service =
+        VirtualLibraryService::new(pool.clone(), server_storage.clone(), media_storage.clone());
+
+    #[cfg(debug_assertions)]
+    let mut debug_server_ids = Vec::with_capacity(loaded_config.preconfigured_servers.len());
 
     if !loaded_config.preconfigured_servers.is_empty() {
         info!(
-            "Adding {} preconfigured servers from config",
+            "Configuring {} preconfigured servers from config",
             loaded_config.preconfigured_servers.len()
         );
         for server in &loaded_config.preconfigured_servers {
             match server_storage
-                .add_server(
+                .upsert_preconfigured_server(
                     &server.name,
                     &server.url,
                     server.priority,
@@ -389,20 +396,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
             {
-                Ok(_) => {
+                Ok(_server_id) => {
                     info!(
-                        "  Added preconfigured server: {} ({}) with priority {}",
+                        "  Configured server: {} ({}) with priority {}",
                         server.name, server.url, server.priority
                     );
+                    #[cfg(debug_assertions)]
+                    debug_server_ids.push(_server_id);
                 }
                 Err(e) => {
                     error!(
-                        "  Failed to add preconfigured server {} ({}): {}",
+                        "  Failed to configure server {} ({}): {}",
                         server.name, server.url, e
                     );
                 }
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    if let Some(debug_user) = &loaded_config.debug_user {
+        let mapping_count = debug_initialization::initialize_debug_user(
+            debug_user,
+            &debug_server_ids,
+            &user_authorization,
+            &server_storage,
+        )
+        .await?;
+        info!(
+            "Configured debug user '{}' with {} server mappings",
+            debug_user.username, mapping_count
+        );
     }
 
     match server_storage.list_servers().await {
@@ -428,7 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_authorization: Arc::new(user_authorization.clone()),
         server_storage: Arc::new(server_storage.clone()),
         media_storage: Arc::new(media_storage.clone()),
-        merged_library_service: Arc::new(merged_library_service),
+        virtual_library_service: Arc::new(virtual_library_service),
         play_sessions: Arc::new(SessionStorage::new()),
         config: Arc::new(tokio::sync::RwLock::new(loaded_config.clone())),
     };
