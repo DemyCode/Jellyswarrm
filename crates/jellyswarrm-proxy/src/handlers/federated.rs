@@ -1273,11 +1273,14 @@ async fn process_media_items_for_server(
     state: &AppState,
     server: &Server,
     should_change_name: bool,
+    proxy_api_key: Option<&str>,
 ) -> Result<Vec<MediaItem>, StatusCode> {
     let mut processed = Vec::with_capacity(items.len());
     for item in items {
-        processed
-            .push(process_media_item_for_server(item, state, server, should_change_name).await?);
+        processed.push(
+            process_media_item_for_server(item, state, server, should_change_name, proxy_api_key)
+                .await?,
+        );
     }
     Ok(processed)
 }
@@ -1287,6 +1290,7 @@ async fn build_virtual_library_item(
     group: Vec<ServerMediaItem>,
     display_name: String,
     virtual_id: String,
+    proxy_api_key: Option<&str>,
 ) -> Result<BuiltVirtualLibrary, StatusCode> {
     let mut members = Vec::new();
     let mut template = None;
@@ -1307,7 +1311,8 @@ async fn build_virtual_library_item(
 
     for (index, ServerMediaItem { item, server }) in group.into_iter().enumerate() {
         total_child_count += item.child_count.unwrap_or(0);
-        let processed = process_media_item_for_server(item, state, &server, false).await?;
+        let processed =
+            process_media_item_for_server(item, state, &server, false, proxy_api_key).await?;
         members.push((server.id, processed.id.clone()));
         if Some(index) == image_source_index {
             image_source_id = Some(processed.id.clone());
@@ -1377,13 +1382,15 @@ async fn process_library_folder(
     item: MediaItem,
     server: &Server,
     should_change_name: bool,
+    proxy_api_key: Option<&str>,
 ) -> Result<MediaItem, StatusCode> {
     let primary_tag = item
         .image_tags
         .as_ref()
         .and_then(|tags| tags.get("Primary").cloned());
     let mut processed =
-        process_media_item_for_server(item, state, server, should_change_name).await?;
+        process_media_item_for_server(item, state, server, should_change_name, proxy_api_key)
+            .await?;
     let image_source_id = processed.id.clone();
     attach_library_folder_image_source(
         &mut processed,
@@ -1435,6 +1442,7 @@ async fn process_media_item_for_server(
     state: &AppState,
     server: &Server,
     should_change_name: bool,
+    proxy_api_key: Option<&str>,
 ) -> Result<MediaItem, StatusCode> {
     let mut item_json = serde_json::to_value(item).map_err(|e| {
         error!("Failed to serialize media item JSON: {}", e);
@@ -1447,7 +1455,7 @@ async fn process_media_item_for_server(
             server,
             ResponseProcessingProfile::Media,
             should_change_name,
-            None,
+            proxy_api_key,
         )
         .await?;
 
