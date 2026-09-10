@@ -32,6 +32,8 @@ pub static MEDIA_ID_PATH_TAGS: &[&str] = &[
 
 // Image `Tag` query values are opaque cache tokens and must not be remapped.
 pub static MEDIA_ID_QUERY_TAGS: &[&str] = &[
+    "AlbumId",
+    "AlbumIds",
     "ParentId",
     "ItemId",
     "SeriesId",
@@ -40,6 +42,10 @@ pub static MEDIA_ID_QUERY_TAGS: &[&str] = &[
     "startItemId",
     "IDs",
     "PersonIds",
+    "ArtistIds",
+    "ContributingArtistIds",
+    "AlbumArtistIds",
+    "ExcludeArtistIds",
 ];
 
 pub static USER_ID_PATH_TAGS: &[&str] = &["Users"];
@@ -254,14 +260,15 @@ impl UrlProcessor {
         let mut pairs = Vec::new();
 
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            let value = if matches_case_insensitive(&key, API_KEY_QUERY_TAGS) {
+            if matches_case_insensitive(&key, API_KEY_QUERY_TAGS) {
+                changed = true;
                 if let Some(proxy_api_key) = proxy_api_key {
-                    changed = true;
-                    proxy_api_key.to_string()
-                } else {
-                    value.into_owned()
+                    pairs.push((key.into_owned(), proxy_api_key.to_string()));
                 }
-            } else if matches_case_insensitive(&key, MEDIA_ID_QUERY_TAGS) {
+                continue;
+            }
+
+            let value = if matches_case_insensitive(&key, MEDIA_ID_QUERY_TAGS) {
                 let remapped = self.remap_delivery_url_query_value(&value, server).await?;
                 if remapped != value {
                     changed = true;
@@ -607,6 +614,58 @@ mod tests {
                 .find(|(key, _)| key.eq_ignore_ascii_case("tag"))
                 .map(|(_, value)| value.into_owned()),
             Some(mapping.virtual_media_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_ids_query_param_is_remapped_to_real_upstream_id() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let server_storage = ServerStorageService::new(pool.clone());
+        let server_id = server_storage
+            .add_server(
+                "Server",
+                "http://server.example",
+                100,
+                MediaStreamingMode::Redirect,
+            )
+            .await
+            .unwrap();
+        let server = server_storage
+            .get_server_by_id(server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let media_storage = MediaStorageService::new(pool.clone());
+        let mapping = media_storage
+            .get_or_create_media_mapping("upstream-id", &server)
+            .await
+            .unwrap();
+        let virtual_libraries =
+            VirtualLibraryService::new(pool.clone(), server_storage.clone(), media_storage.clone());
+        let processor = UrlProcessor::new(DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool)),
+            server_storage: Arc::new(server_storage),
+            media_storage: Arc::new(media_storage),
+            virtual_library_service: Arc::new(virtual_libraries),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        });
+        let mut url = url::Url::parse(&format!(
+            "http://localhost/Items?ContributingArtistIds={}",
+            mapping.virtual_media_id
+        ))
+        .unwrap();
+
+        processor
+            .client_to_server_url(&mut url, &None, None, Some(server_id))
+            .await;
+
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key.eq_ignore_ascii_case("ContributingArtistIds"))
+                .map(|(_, value)| value.into_owned()),
+            Some(mapping.original_media_id)
         );
     }
 }
