@@ -366,10 +366,13 @@ async fn fetch_catalog(
 async fn process_library_group_individually(
     state: &AppState,
     group: Vec<ServerMediaItem>,
+    proxy_api_key: Option<&str>,
 ) -> Result<Vec<MediaItem>, StatusCode> {
     let mut items = Vec::with_capacity(group.len());
     for ServerMediaItem { item, server } in group {
-        items.push(process_media_item_for_server(item, state, &server, true).await?);
+        items.push(
+            process_media_item_for_server(item, state, &server, true, proxy_api_key).await?,
+        );
     }
     Ok(items)
 }
@@ -380,6 +383,7 @@ async fn present_automatic_library_group(
     group: Vec<ServerMediaItem>,
     access_scope: &VirtualLibraryAccessScope,
     complete_refresh: bool,
+    proxy_api_key: Option<&str>,
 ) -> Result<AutomaticGroupPresentation, StatusCode> {
     if group.len() == 1 {
         if !complete_refresh {
@@ -413,6 +417,7 @@ async fn present_automatic_library_group(
                         group,
                         display_name,
                         automatic.virtual_id.clone(),
+                        proxy_api_key,
                     )
                     .await?;
                     let discovered_members = built
@@ -431,7 +436,7 @@ async fn present_automatic_library_group(
         }
 
         return Ok(AutomaticGroupPresentation {
-            items: process_library_group_individually(state, group).await?,
+            items: process_library_group_individually(state, group, proxy_api_key).await?,
             discovered_members: Vec::new(),
         });
     }
@@ -453,14 +458,19 @@ async fn present_automatic_library_group(
         Err(error) => {
             error!("Failed to get/create merged library for '{key}': {error}");
             return Ok(AutomaticGroupPresentation {
-                items: process_library_group_individually(state, group).await?,
+                items: process_library_group_individually(state, group, proxy_api_key).await?,
                 discovered_members: Vec::new(),
             });
         }
     };
-    let built =
-        build_virtual_library_item(state, group, display_name, automatic.virtual_id.clone())
-            .await?;
+    let built = build_virtual_library_item(
+        state,
+        group,
+        display_name,
+        automatic.virtual_id.clone(),
+        proxy_api_key,
+    )
+    .await?;
     let discovered_members = built
         .members
         .into_iter()
@@ -475,6 +485,7 @@ async fn present_automatic_library_group(
 async fn partition_library_root_inventory(
     state: &AppState,
     server_items: Vec<FetchedServerItems>,
+    proxy_api_key: Option<&str>,
 ) -> Result<LibraryRootInventory, StatusCode> {
     let assignments = state
         .virtual_library_service
@@ -547,7 +558,14 @@ async fn partition_library_root_inventory(
 
         if !non_library_items.is_empty() {
             let processed =
-                process_media_items_for_server(non_library_items, state, &server, true).await?;
+                process_media_items_for_server(
+                    non_library_items,
+                    state,
+                    &server,
+                    true,
+                    proxy_api_key,
+                )
+                .await?;
             if !processed.is_empty() {
                 non_library_per_server.push(ServerItems {
                     response: ItemsResponseVariants::Bare(processed),
@@ -575,6 +593,9 @@ async fn get_automatic_library_root(
         ..
     } = preprocessed;
     let access_scope = access_scope.ok_or(StatusCode::UNAUTHORIZED)?;
+    let proxy_api_key = JellyfinAuthorization::from_request(&original_request)
+        .and_then(|auth| auth.token_ref().map(str::to_string));
+    let proxy_api_key = proxy_api_key.as_deref();
     let refresh_generation = state
         .virtual_library_service
         .begin_automatic_library_refresh(&access_scope)
@@ -593,7 +614,7 @@ async fn get_automatic_library_root(
         configured_groups,
         unassigned_libraries,
         non_library_per_server,
-    } = partition_library_root_inventory(state, server_items).await?;
+    } = partition_library_root_inventory(state, server_items, proxy_api_key).await?;
     let mut library_groups: HashMap<String, Vec<ServerMediaItem>> = HashMap::new();
     for source in unassigned_libraries {
         let Some(key) = automatic_library_key(&source.item) else {
@@ -602,14 +623,22 @@ async fn get_automatic_library_root(
         library_groups.entry(key).or_default().push(source);
     }
 
-    let mut library_items = present_configured_library_groups(state, configured_groups).await?;
+    let mut library_items =
+        present_configured_library_groups(state, configured_groups, proxy_api_key).await?;
     let mut discovered_members = Vec::new();
     let mut automatic_groups = library_groups.into_iter().collect::<Vec<_>>();
     automatic_groups.sort_by(|left, right| left.0.cmp(&right.0));
     for (key, group) in automatic_groups {
         let presentation =
-            present_automatic_library_group(state, key, group, &access_scope, failures == 0)
-                .await?;
+            present_automatic_library_group(
+                state,
+                key,
+                group,
+                &access_scope,
+                failures == 0,
+                proxy_api_key,
+            )
+            .await?;
         library_items.extend(presentation.items);
         discovered_members.extend(presentation.discovered_members);
     }
@@ -635,6 +664,7 @@ async fn get_automatic_library_root(
 async fn present_configured_library_groups(
     state: &AppState,
     configured_library_groups: HashMap<String, NamedMediaItemGroup>,
+    proxy_api_key: Option<&str>,
 ) -> Result<Vec<MediaItem>, StatusCode> {
     let mut group_entries = configured_library_groups.into_iter().collect::<Vec<_>>();
     group_entries.sort_by(|left, right| {
@@ -648,11 +678,17 @@ async fn present_configured_library_groups(
     let mut library_join = JoinSet::new();
     for (index, (group_virtual_id, group)) in group_entries.into_iter().enumerate() {
         let state = state.clone();
+        let proxy_api_key = proxy_api_key.map(str::to_string);
         library_join.spawn(async move {
-            let item =
-                build_virtual_library_item(&state, group.items, group.name, group_virtual_id)
-                    .await
-                    .map(|built| built.item);
+            let item = build_virtual_library_item(
+                &state,
+                group.items,
+                group.name,
+                group_virtual_id,
+                proxy_api_key.as_deref(),
+            )
+            .await
+            .map(|built| built.item);
             (index, item)
         });
     }
@@ -681,6 +717,9 @@ async fn get_configured_library_root(
     targets: Vec<CatalogFetchTarget>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let original_request = preprocessed.original_request;
+    let proxy_api_key = JellyfinAuthorization::from_request(&original_request)
+        .and_then(|auth| auth.token_ref().map(str::to_string));
+    let proxy_api_key = proxy_api_key.as_deref();
     let FetchedCatalog {
         server_items,
         response_shape,
@@ -690,8 +729,9 @@ async fn get_configured_library_root(
         configured_groups,
         unassigned_libraries,
         non_library_per_server,
-    } = partition_library_root_inventory(state, server_items).await?;
-    let mut library_items = present_configured_library_groups(state, configured_groups).await?;
+    } = partition_library_root_inventory(state, server_items, proxy_api_key).await?;
+    let mut library_items =
+        present_configured_library_groups(state, configured_groups, proxy_api_key).await?;
     let mut single_groups = HashMap::new();
     for source in unassigned_libraries {
         let key = format!(
@@ -704,7 +744,9 @@ async fn get_configured_library_root(
     let mut single_groups = single_groups.into_iter().collect::<Vec<_>>();
     single_groups.sort_by(|left, right| left.0.cmp(&right.0));
     for (_key, ServerMediaItem { item, server }) in single_groups {
-        library_items.push(process_library_folder(state, item, &server, true).await?);
+        library_items.push(
+            process_library_folder(state, item, &server, true, proxy_api_key).await?,
+        );
     }
 
     let items = FederatedItems::new(library_items).merge_interleaved(non_library_per_server);
